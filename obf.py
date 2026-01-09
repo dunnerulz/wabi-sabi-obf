@@ -332,6 +332,112 @@ class WabiSabiObfuscator:
         return "\n".join(out_lines)
 
     # =========================================================================
+    # CONTROL FLOW FLATTENING (The "Maze")
+    # =========================================================================
+
+    def _apply_control_flow_flattening(self, lua_code):
+        """
+        Applies MoonVeil-Style Control Flow Flattening (CFF).
+        
+        1.  **Block Splitting**: Identifies 'if/then/end', 'while', 'repeat' structures to find safe "Basic Blocks" of code.
+            To stay safe and avoid breaking scoping/upvalues, we primarily target the top-level statements or large function bodies.
+            For this implementation, we will perform CFF on specific target functions if identified, or try to flatten the main chunk.
+            
+        2.  **State Machine**: Wraps blocks in a 'while state != 0 do' loop.
+        
+        3.  **Arithmetic Transitions**: Uses 'state = state + delta' instead of 'state = X'.
+        """
+        
+        # NOTE: A full robust AST parser is needed for perfect CFF on complex nested structures.
+        # We will implement a simplified version that targets sequential blocks of code 
+        # to demonstrate the technique without breaking the complex nested logic of the input script.
+        # We will wrap the MAIN execution flow into a flattened dispatcher.
+
+        tokens = self._tokenize(lua_code)
+        
+        # We'll identify "chunks". A chunk is separated by logical boundaries.
+        # For simplicity in this regex-based/token-based approach:
+        # We will treat top-level chunks as our blocks.
+        
+        # However, to be safer with "local" scoping, we only flatten code that doesn't declare locals used across blocks.
+        # OR we hoist declarations. Hoisting is complex.
+        
+        # ALTERNATIVE STRATEGY FOR STABILITY:
+        # We will wrap the ENTIRE script in a dispatcher that only has 1 real block (the original code)
+        # and several FAKE blocks (dead code) with Opaque Predicate jumps.
+        # This creates the "Maze" structure without risking breaking local variables in the original code.
+        # This effectively hides the entry point.
+        
+        # Let's build the "Maze" wrapper.
+        
+        real_block_id = random.randint(10000, 99999)
+        exit_block_id = 0
+        
+        # Generate some fake blocks
+        fake_blocks = []
+        for _ in range(3):
+            fake_id = random.randint(10000, 99999)
+            while fake_id == real_block_id: fake_id = random.randint(10000, 99999)
+            fake_content = self._generate_junk_code()
+            fake_blocks.append((fake_id, fake_content))
+            
+        # The Dispatcher Variable
+        var_state = self._generate_random_string(4)
+        
+        # Start State
+        start_state = real_block_id
+        
+        # Construct the Dispatcher
+        # while var_state ~= 0 do
+        
+        dispatcher_code = []
+        dispatcher_code.append(f"local {var_state} = {start_state}")
+        dispatcher_code.append(f"while {var_state} ~= 0 do")
+        
+        # Create a shuffled list of blocks (Real + Fake)
+        all_blocks = []
+        
+        # 1. The Real Block
+        # We wrap the original code in a block.
+        # Important: If original code uses 'return', it might break the loop. 
+        # But for a main chunk, it's usually fine.
+        # To leave the loop, we set state = 0 at the end of the real block.
+        
+        # Arithmetic transition to 0: state = state + (0 - current)
+        transition_to_end = f"{var_state} = {var_state} + ({exit_block_id} - {real_block_id})"
+        
+        real_block_content = f"{lua_code}\n{transition_to_end}"
+        all_blocks.append((real_block_id, real_block_content))
+        
+        # 2. Add Fake Blocks
+        for fid, fcontent in fake_blocks:
+            # Fake blocks jump to another fake block or end to simulate flow
+            target = 0
+            # Arithmetic jump
+            trans = f"{var_state} = {var_state} + ({target} - {fid})"
+            all_blocks.append((fid, fcontent + "\n" + trans))
+            
+        # Shuffle them for the if/elseif ladder
+        random.shuffle(all_blocks)
+        
+        # Build the if/elseif ladder
+        for i, (bid, content) in enumerate(all_blocks):
+            check_stmt = "if" if i == 0 else "elseif"
+            
+            # Opaque Predicate for the state check? 
+            # state == bid
+            # We can leave it simple for the switch, or obfuscate the constants later with _mangle_number.
+            
+            dispatcher_code.append(f"    {check_stmt} {var_state} == {bid} then")
+            dispatcher_code.append(f"        {content}")
+            
+        dispatcher_code.append("    end")
+        dispatcher_code.append("    wait(0.001)") # Safety wait for the loop
+        dispatcher_code.append("end")
+        
+        return "\n".join(dispatcher_code)
+
+    # =========================================================================
     # CORE PIPELINE
     # =========================================================================
 
@@ -364,33 +470,35 @@ end
         1. Clean (Remove Comments)
         2. AST Logic Inversion (Strategy A)
         3. Contextual Predicates (Strategy B)
-        4. Mangle Numbers (including those generated in 2/3)
-        5. Mangle Strings
-        6. Virtualize Globals
+        4. Control Flow Flattening (The Maze) - NEW
+        5. Mangle Numbers (including those generated in 2/3/4)
+        6. Mangle Strings
+        7. Virtualize Globals
         """
         
         # 1. Clean
         lua_source = self._remove_comments(lua_source)
 
         # 2. Strategy A: Logic Inversion (AST Traversal)
-        # We do this BEFORE mangling so the inserted "not" and "if" are processed cleanly,
-        # and inserted numbers can be mangled later.
         lua_source = self._process_logic_inversion(lua_source)
         
         # 3. Strategy B: Contextual Predicates (Injection)
-        # Inject math checks around statements.
         lua_source = self._inject_contextual_predicates(lua_source)
 
-        # 4. Mangle Numbers
-        # This will now also mangle the constants inside our Opaque Predicates (Strategy B)
-        # e.g., (10 * 10 >= 0) -> ((5+5) * (12-2) >= (0))
+        # 4. Control Flow Flattening (The Maze)
+        # We wrap the processed code in the maze structure.
+        lua_source = self._apply_control_flow_flattening(lua_source)
+
+        # 5. Mangle Numbers
+        # This will now also mangle the constants inside our Opaque Predicates and State Transitions
+        # e.g., state = state + (-84379) -> state = state + ((10-94883) + ...)
         number_pattern = r'\b\d+(?:\.\d+)?\b'
         def replace_number(match):
             return self._mangle_number(match.group(0))
         
         protected_code = re.sub(number_pattern, replace_number, lua_source)
         
-        # 5. Mangle Strings
+        # 6. Mangle Strings
         string_pattern = r'("([^"]*)"|\'([^\']*)\')'
         def replace_string(match):
             if match.group(2) is not None:
@@ -401,10 +509,10 @@ end
 
         protected_code = re.sub(string_pattern, replace_string, protected_code)
 
-        # 6. Mangle Globals
+        # 7. Mangle Globals
         protected_code = self._mangle_globals(protected_code)
 
-        # 7. Header
+        # 8. Header
         final_code = self._generate_header() + "\n" + protected_code
         
         return final_code
