@@ -168,14 +168,39 @@ local {self.var_Ea}=function(ib,da)
 end
 """
 
+    def _remove_comments(self, source):
+        """
+        Removes Lua comments (both single-line and multi-line) while preserving strings.
+        """
+        # Pattern to capture strings (short and long) and comments
+        # Group 1: Short strings "..." or '...'
+        # Group 2: Long strings [[ ... ]] or [=[ ... ]=]
+        # Group 4: Comments --[[ ... ]] or -- ...
+        pattern = r'(?s)("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')|(\[(=*)\[.*?\]\3\])|(--\[(=*)\[.*?\]\5\]|--[^\n\r]*)'
+        
+        def replacer(match):
+            # If it's a comment (Group 4), replace with a space to maintain separation
+            # (or simple removal, but space is safer to avoid token merging)
+            if match.group(4):
+                return " "
+            # Otherwise it's a string, return as is
+            return match.group(0)
+            
+        return re.sub(pattern, replacer, source)
+
     def obfuscate(self, lua_source):
         """
         Logic:
+        0. Remove Comments (New Step)
         1. Mangle Numbers (Constant Folding)
         2. Mangle Strings (Polyadic XOR)
         3. Environment Virtualization (Globals -> Ma[Ea])
         """
         
+        # 0. Remove Comments
+        # We do this first to clean the code before processing
+        lua_source = self._remove_comments(lua_source)
+
         # 1. Mangle Numbers
         number_pattern = r'\b\d+(?:\.\d+)?\b'
         def replace_number(match):
@@ -213,8 +238,8 @@ if __name__ == "__main__":
     local LocalPlayer = game:GetService("Players").LocalPlayer
     local RunService = game:GetService("RunService")
     
-    local x = 100
-    local y = 200.5
+    local x = 100 -- This is a comment
+    local y = 200.5 --[[ Another comment ]]
     
     print("Starting Loop")
     while true do
