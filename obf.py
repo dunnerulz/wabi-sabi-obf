@@ -18,36 +18,18 @@ class WabiSabiObfuscator:
     def _xor_encrypt(self, text, key):
         """
         Encrypts a string for the Ea() function.
-        Matches the logic: 
-        byte(char) XOR byte(key[(i + math_offset) % len(key)])
-        The math offset in Lua is (kd-2053812/22084)%#da
-        2053812 / 22084 approx 93. So (kd - 93) % key_len.
-        To keep Python sync simple, we will simulate the result the Lua code expects.
         """
         encrypted_chars = []
         key_len = len(key)
         
         # The Lua math noise: (kd-2053812/22084)%#da
-        # We can just pick a static integer for the Python side that represents the result of that division
-        # 2053812 / 22084 = 93.0
+        # 2053812 / 22084 approx 93. So (kd - 93) % key_len.
         OFFSET_VAL = 93 
         
         for i, char in enumerate(text):
-            kd = i + 1 # Lua uses 1-based indexing for the loop
-            
-            # Calculate the index of the key character used in Lua
-            # Lua: (kd - 93) % #da + 1  (because lua arrays are 1-based)
-            # We map this to 0-based index for Python string access:
-            # key_index = ((kd - 93) % key_len) 
-            # Note: Python % handles negative numbers differently than Lua for some cases, 
-            # but for simple encryption rotation it's fine if we are consistent.
-            # To be safe and match Lua's behavior exactly:
+            kd = i + 1 # Lua uses 1-based indexing
             lua_mod_index = (kd - OFFSET_VAL) % key_len
-            
-            # Since Lua 1-based index `+1` is usually done after mod, the char at `lua_mod_index` 
-            # in Python (0-based) corresponds to the key char used.
             key_char_code = ord(key[int(lua_mod_index)])
-            
             char_code = ord(char)
             enc_code = char_code ^ key_char_code
             encrypted_chars.append(f"\\{enc_code}")
@@ -92,23 +74,14 @@ class WabiSabiObfuscator:
 
     def _mangle_string(self, text):
         """Wraps string in Ea('encrypted', 'key')"""
-        # Generate random key
         key = self._generate_random_string(random.randint(4, 8))
         encrypted = self._xor_encrypt(text, key)
-        
-        # Mangle the key string itself so it's not plain text in the source?
-        # For now, we leave the key as a plain string literal to avoid infinite recursion
-        # but in a real Wabi Sabi environment, the key itself might be obfuscated further or generated.
-        # We will just return the Ea call.
-        
         return f"{self.var_Ea}('{encrypted}','{key}')"
 
     def _mangle_globals(self, lua_code):
         """
         Replaces global function calls with Ma[Ea('print')]...
-        Includes a check to avoid mangling 'local game =' declarations or table properties.
         """
-        # List of common globals to mangle (Standard Lua + Roblox/Matcha Specifics)
         targets = [
             "print", "warn", "error", "game", "workspace", "math", "table", "string", 
             "task", "wait", "spawn", "getfenv", "setfenv", "pcall", "xpcall", 
@@ -118,42 +91,252 @@ class WabiSabiObfuscator:
             "utf8", "os", "coroutine", "debug", "tick", "time", "delay", "defer",
             "getgenv", "getrenv", "identifyexecutor", "setclipboard", "readfile", 
             "writefile", "isfile", "delfile", "listfiles", "makefolder", "delfolder",
-            "iskeypressed", "mouse1click", "ismouse1pressed", "mouse2click", "ismouse2pressed"
+            "iskeypressed", "mouse1click", "ismouse1pressed", "mouse2click", "ismouse2pressed",
+            "getscripthash", "isrbxactive", "keyrelease", "keypress", "mouse1press",
+            "mouse1release", "mouse2press", "mouse2release", "mousemoveabs", "mousemoverel",
+            "mousescroll", "run_secure", "setfflag", "getfflag", "loadstring", "decompile"
         ]
         
-        # Sort targets by length descending to prevent substring issues (e.g. replacing 'os' inside 'position')
         targets.sort(key=len, reverse=True)
 
         for target in targets:
-            # Regex Explanation:
-            # (?<!\.)       : Negative lookbehind. Ensures the target is NOT preceded by a dot (e.g. avoid mangling myTable.print)
-            # (\blocal\s+)? : Optional Group 1. Matches 'local ' followed by whitespace. 
-            #                 Used to detect variable declarations.
-            # \bTARGET\b    : Matches the target word with word boundaries (e.g. matches 'game' but not 'gameplay')
-            
+            # Lookbehind to ensure not a property, Group 1 for local check, Group 2 for word
             pattern = r'(?<!\.)(\blocal\s+)?\b(' + re.escape(target) + r')\b'
             
             def replace_match(match):
                 prefix = match.group(1) # 'local ' or None
                 word = match.group(2)   # The target global name
-                
-                # If preceded by 'local ', do NOT mangle the name (e.g., 'local game')
                 if prefix:
                     return f"{prefix}{word}"
-                
-                # Otherwise, mangle it (e.g., '= game' becomes '= Ma[Ea("game", key)]')
                 return f"{self.var_Ma}[{self._mangle_string(word)}]"
             
             lua_code = re.sub(pattern, replace_match, lua_code)
             
         return lua_code
 
-    def _generate_header(self):
-        """Generates the Wabi Sabi boilerplate (Ma, Ea, Ta)"""
-        # Defines the Ea function with the specific math noise mentioned in prompt:
-        # (kd-2053812/22084)%#da
-        # 2053812/22084 evaluates to ~93.
+    # =========================================================================
+    # OPAQUE PREDICATE & LOGIC INVERSION SYSTEM (Strategies A & B)
+    # =========================================================================
+
+    def _generate_junk_code(self):
+        """
+        Generates garbage Lua code that is syntactically valid but does nothing useful.
+        Adheres to 'Lua vm fps... prefer wait(.001)' for loops.
+        """
+        var_name = self._generate_random_string(4)
+        var_name_2 = self._generate_random_string(4)
         
+        junk_types = [
+            # Type 1: Useless Math Loop
+            f"local {var_name} = 0; for i=1, {random.randint(2, 5)} do {var_name}={var_name}+1; wait(0.001); end",
+            # Type 2: Table Junk
+            f"local {var_name} = {{}}; {var_name}[1] = {random.randint(1,99)};",
+            # Type 3: Simple math
+            f"local {var_name} = {random.randint(10,999)} * {random.randint(2,9)};",
+            # Type 4: Double variable junk
+            f"local {var_name} = 1; local {var_name_2} = 2; {var_name} = {var_name} + {var_name_2};"
+        ]
+        return random.choice(junk_types)
+
+    def _generate_opaque_predicate(self):
+        """
+        Generates a Contextual Opaque Predicate (Strategy B).
+        Returns a tuple: (Condition String, Boolean Value)
+        Example: ('(5 * 5 >= 0)', True)
+        """
+        
+        # Strategy: Math Tautologies
+        # We use raw numbers here; they will be mangled later by _mangle_number in the main pipeline.
+        
+        val_a = random.randint(10, 500)
+        val_b = random.randint(10, 500)
+        
+        predicates = [
+            # Square is always >= 0
+            (f"( ({val_a} * {val_a}) >= 0 )", True),
+            # Absolute value check
+            (f"( math.abs({-val_a}) == {val_a} )", True),
+            # Impossible check
+            (f"( {val_a} < {-val_a} )", False),
+            # Simple inequality
+            (f"( {val_a} + {val_b} == {val_a + val_b} )", True)
+        ]
+        
+        return random.choice(predicates)
+
+    def _tokenize(self, code):
+        """
+        Splits code into a list of (type, value) tokens for safe AST traversal.
+        Does NOT simplify logic.
+        """
+        token_specification = [
+            ('COMMENT', r'--\[\[.*?\]\]|--[^\n]*'), # Matches --[[...]] or --...
+            ('STRING',  r'("([^"\\]|\\.)*")|(\'([^\'\\]|\\.)*\')|(\[\[.*?\]\])'), # Strings
+            ('KEYWORD', r'\b(if|then|else|elseif|end|do|function|repeat|until|while|for|local)\b'), # Keywords for blocking
+            ('IDENT',   r'[A-Za-z_][A-Za-z0-9_]*'),    # Identifiers
+            ('OP',      r'[+\-*/%^#=~<>()\[\]{},;.]'), # Operators
+            ('NUMBER',  r'0[xX][0-9a-fA-F]+|\d+(\.\d*)?'), # Numbers (Updated to include Hex)
+            ('WS',      r'\s+'),                       # Whitespace
+            ('MISC',    r'.'),                         # Any other char
+        ]
+        tok_regex = '|'.join('(?P<%s>%s)' % pair for pair in token_specification)
+        tokens = []
+        for mo in re.finditer(tok_regex, code, re.DOTALL | re.MULTILINE):
+            kind = mo.lastgroup
+            value = mo.group()
+            if kind == 'WS': continue 
+            tokens.append((kind, value))
+        return tokens
+
+    def _reconstruct(self, tokens):
+        """Rebuilds string from tokens (simple concatenation with spacing safety)."""
+        # A simple join is often enough if we kept whitespace, but we stripped it.
+        # We need to insert spaces between keywords/idents.
+        out = []
+        for i, (kind, val) in enumerate(tokens):
+            if i > 0:
+                prev_kind = tokens[i-1][0]
+                # Add space if needed
+                if (prev_kind in ['KEYWORD', 'IDENT', 'NUMBER'] and kind in ['KEYWORD', 'IDENT', 'NUMBER']):
+                    out.append(' ')
+            out.append(val)
+        return "".join(out)
+
+    def _process_logic_inversion(self, lua_code):
+        """
+        AST Traversal & Logic Inversion (Strategy A).
+        Finds 'if A then B end' and converts to 'if not (A) then JUNK else B end'.
+        This plays it safe: only inverts simple if-blocks with no else/elseif to avoid breaking logic.
+        """
+        tokens = self._tokenize(lua_code)
+        
+        # We will rebuild the code token by token.
+        # When we hit an 'if', we try to scan ahead to see if it's a candidate for inversion.
+        
+        transformed_tokens = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            
+            # Look for 'if'
+            if token[0] == 'KEYWORD' and token[1] == 'if':
+                
+                # Check scanning ahead
+                # We need to find 'then', capture condition, then find 'end' ensuring balanced nesting.
+                # If we encounter 'else' or 'elseif' at the current depth, we ABORT inversion for this block.
+                
+                scan_i = i + 1
+                condition_tokens = []
+                
+                # Scan Condition
+                while scan_i < len(tokens) and tokens[scan_i][1] != 'then':
+                    condition_tokens.append(tokens[scan_i])
+                    scan_i += 1
+                
+                if scan_i < len(tokens) and tokens[scan_i][1] == 'then':
+                    # Found 'then', consume it
+                    scan_i += 1 
+                    
+                    # Scan Body
+                    body_tokens = []
+                    depth = 1 # We are inside the 'if'
+                    
+                    valid_candidate = True
+                    
+                    body_start_index = scan_i
+                    
+                    while scan_i < len(tokens):
+                        t_kind, t_val = tokens[scan_i]
+                        
+                        if t_val == 'if' or t_val == 'do' or t_val == 'function' or t_val == 'repeat':
+                            depth += 1
+                        elif t_val == 'end' or t_val == 'until':
+                            depth -= 1
+                        elif (t_val == 'else' or t_val == 'elseif') and depth == 1:
+                            # Found an else/elseif at the same level! Logic Inversion is unsafe/complex here.
+                            valid_candidate = False
+                            break
+                        
+                        if depth == 0:
+                            # Found the closing 'end'
+                            break
+                            
+                        body_tokens.append(tokens[scan_i])
+                        scan_i += 1
+                    
+                    if valid_candidate and depth == 0:
+                        # We successfully identified a simple if..then..end block.
+                        # APPLY STRATEGY A: LOGIC INVERSION
+                        # Structure: if not (CONDITION) then JUNK else BODY end
+                        
+                        junk_code_str = self._generate_junk_code()
+                        # Tokenize junk code to add it to stream
+                        junk_tokens = self._tokenize(junk_code_str)
+                        
+                        transformed_tokens.append(('KEYWORD', 'if'))
+                        transformed_tokens.append(('KEYWORD', 'not'))
+                        transformed_tokens.append(('OP', '('))
+                        transformed_tokens.extend(condition_tokens)
+                        transformed_tokens.append(('OP', ')'))
+                        transformed_tokens.append(('KEYWORD', 'then'))
+                        transformed_tokens.extend(junk_tokens)
+                        transformed_tokens.append(('KEYWORD', 'else'))
+                        transformed_tokens.extend(body_tokens)
+                        transformed_tokens.append(('KEYWORD', 'end'))
+                        
+                        i = scan_i + 1 # Skip past the consumed tokens (including 'end')
+                        continue
+
+            # If not transformed, append original
+            transformed_tokens.append(token)
+            i += 1
+            
+        return self._reconstruct(transformed_tokens)
+
+    def _inject_contextual_predicates(self, lua_code):
+        """
+        Strategy B: Wraps arbitrary valid statements in Opaque Predicates.
+        if (TrueMath) then [Original] else [Junk] end
+        """
+        lines = lua_code.split('\n')
+        out_lines = []
+        
+        for line in lines:
+            stripped = line.strip()
+            # Safety check: Only wrap lines that look like complete statements (variable assignments, function calls)
+            # Avoid wrapping 'end', 'else', or start of blocks if not careful.
+            # Best to target variable assignments or void function calls.
+            
+            is_assignment = re.match(r'^(local\s+)?[a-zA-Z_0-9.]+\s*=[^=]', stripped)
+            is_void_call = re.match(r'^[a-zA-Z_0-9.:]+\(.*\)$', stripped)
+            
+            if (is_assignment or is_void_call) and not stripped.endswith('do') and not stripped.endswith('then'):
+                # 30% chance to wrap in opaque predicate
+                if random.random() < 0.3:
+                    pred_str, is_true = self._generate_opaque_predicate()
+                    junk = self._generate_junk_code()
+                    
+                    if is_true:
+                        # if (True) then Real else Junk
+                        new_block = f"if {pred_str} then {line} else {junk} end"
+                        out_lines.append(new_block)
+                    else:
+                        # if (False) then Junk else Real
+                        new_block = f"if {pred_str} then {junk} else {line} end"
+                        out_lines.append(new_block)
+                else:
+                    out_lines.append(line)
+            else:
+                out_lines.append(line)
+                
+        return "\n".join(out_lines)
+
+    # =========================================================================
+    # CORE PIPELINE
+    # =========================================================================
+
+    def _generate_header(self):
+        """Generates the Wabi Sabi boilerplate"""
         return f"""-- Generated by Wabi Sabi Obfuscator
 local {self.var_Ma}=(getfenv())
 local {self.var_string_char},{self.var_string_byte},{self.var_bit_xor}=(string.char),(string.byte),(bit32 and bit32.bxor or function(a,b) local p,c=1,0 while a>0 and b>0 do local ra,rb=a%2,b%2 if ra~=rb then c=c+p end a,b,p=(a-ra)/2,(b-rb)/2,p*2 end if a<b then a=b end while a>0 do local ra=a%2 if ra>0 then c=c+p end a,p=(a-ra)/2,p*2 end return c end)
@@ -169,49 +352,46 @@ end
 """
 
     def _remove_comments(self, source):
-        """
-        Removes Lua comments (both single-line and multi-line) while preserving strings.
-        """
-        # Pattern to capture strings (short and long) and comments
-        # Group 1: Short strings "..." or '...'
-        # Group 2: Long strings [[ ... ]] or [=[ ... ]=]
-        # Group 4: Comments --[[ ... ]] or -- ...
         pattern = r'(?s)("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')|(\[(=*)\[.*?\]\3\])|(--\[(=*)\[.*?\]\5\]|--[^\n\r]*)'
-        
         def replacer(match):
-            # If it's a comment (Group 4), replace with a space to maintain separation
-            # (or simple removal, but space is safer to avoid token merging)
-            if match.group(4):
-                return " "
-            # Otherwise it's a string, return as is
+            if match.group(4): return " "
             return match.group(0)
-            
         return re.sub(pattern, replacer, source)
 
     def obfuscate(self, lua_source):
         """
-        Logic:
-        0. Remove Comments (New Step)
-        1. Mangle Numbers (Constant Folding)
-        2. Mangle Strings (Polyadic XOR)
-        3. Environment Virtualization (Globals -> Ma[Ea])
+        Pipeline:
+        1. Clean (Remove Comments)
+        2. AST Logic Inversion (Strategy A)
+        3. Contextual Predicates (Strategy B)
+        4. Mangle Numbers (including those generated in 2/3)
+        5. Mangle Strings
+        6. Virtualize Globals
         """
         
-        # 0. Remove Comments
-        # We do this first to clean the code before processing
+        # 1. Clean
         lua_source = self._remove_comments(lua_source)
 
-        # 1. Mangle Numbers
+        # 2. Strategy A: Logic Inversion (AST Traversal)
+        # We do this BEFORE mangling so the inserted "not" and "if" are processed cleanly,
+        # and inserted numbers can be mangled later.
+        lua_source = self._process_logic_inversion(lua_source)
+        
+        # 3. Strategy B: Contextual Predicates (Injection)
+        # Inject math checks around statements.
+        lua_source = self._inject_contextual_predicates(lua_source)
+
+        # 4. Mangle Numbers
+        # This will now also mangle the constants inside our Opaque Predicates (Strategy B)
+        # e.g., (10 * 10 >= 0) -> ((5+5) * (12-2) >= (0))
         number_pattern = r'\b\d+(?:\.\d+)?\b'
         def replace_number(match):
             return self._mangle_number(match.group(0))
         
         protected_code = re.sub(number_pattern, replace_number, lua_source)
         
-        # 2. Mangle Strings
-        # Matches either "..." or '...'
+        # 5. Mangle Strings
         string_pattern = r'("([^"]*)"|\'([^\']*)\')'
-        
         def replace_string(match):
             if match.group(2) is not None:
                 content = match.group(2)
@@ -221,34 +401,35 @@ end
 
         protected_code = re.sub(string_pattern, replace_string, protected_code)
 
-        # 3. Mangle Globals (Environment Virtualization)
-        # We do this LAST so that the strings generated here (keys for Ea) don't get re-mangled.
+        # 6. Mangle Globals
         protected_code = self._mangle_globals(protected_code)
 
-        # 4. Prepend Header
+        # 7. Header
         final_code = self._generate_header() + "\n" + protected_code
         
         return final_code
 
 # --- Usage ---
 if __name__ == "__main__":
-    # Example Input (Matcha compatible)
     input_code = """
     print("Initializing Matcha Script...")
     local LocalPlayer = game:GetService("Players").LocalPlayer
-    local RunService = game:GetService("RunService")
     
-    local x = 100 -- This is a comment
-    local y = 200.5 --[[ Another comment ]]
+    local function check_enemy(target)
+        if target then
+            print("Enemy found")
+            return true
+        end
+        return false
+    end
     
-    print("Starting Loop")
     while true do
         print("Looping...")
+        check_enemy(LocalPlayer)
         task.wait(1)
     end
     """
     
-    # Read from file if exists, else use example
     try:
         with open("input.lua", "r") as f:
             input_code = f.read()
