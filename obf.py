@@ -37,38 +37,17 @@ class WabiSabiObfuscator:
         return "".join(encrypted_chars)
 
     def _mangle_number(self, num_str):
-        """
-        Constant Folding / Number Mangling
-        """
         try:
             val = float(num_str)
-            if val == 0: return "(0)"
-            if val == 1: return "(1)"
+            if val == 0: return "((10-10)*5)"
             
-            is_integer = val.is_integer()
-            op_type = random.choice([0, 1, 3]) 
-            
-            if op_type == 0: # Addition
-                part_a = random.randint(1000, 100000)
-                part_b = val - part_a
-                return f"({part_a}+{part_b})"
-                
-            elif op_type == 1: # Subtraction
-                part_b = random.randint(1000, 100000)
-                part_a = val + part_b
-                return f"({part_a}-{part_b})"
-                
-            elif op_type == 3: # Division
-                if is_integer:
-                    factor = random.randint(2, 50)
-                    numerator = int(val * factor)
-                    return f"({numerator}/{factor})"
-                else:
-                    factor = random.randint(100, 100000)
-                    numerator = val * factor
-                    return f"({numerator}/{factor})"
-            
-            return num_str
+            # MoonVeil Strategy: Float Multiplication
+            # Target: 100
+            # Gen: 0.05 * 2000
+            factor = random.randint(1000, 50000)
+            multiplier = val / factor
+            # Lua format needs high precision
+            return f"({multiplier} * {factor})"
         except:
             return num_str
 
