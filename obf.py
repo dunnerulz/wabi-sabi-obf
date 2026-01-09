@@ -51,6 +51,80 @@ class WabiSabiObfuscator:
         except:
             return num_str
 
+    def _mangle_boolean(self, val):
+        """
+        MoonVeil Logic Gate Booleans:
+        Avoids raw 'true' and 'false' literals by using conditions that evaluate to them.
+        
+        For True:  not(not X) where X is a truthy value (non-zero number)
+                   or comparison like (50 > 20)
+        For False: not(X) where X is a truthy value
+        
+        This obfuscates boolean literals to make static analysis harder.
+        
+        NOTE: We use raw integers here instead of calling _mangle_number() because
+        the number mangling step in the pipeline will handle these integers later.
+        This avoids issues with scientific notation being generated prematurely
+        and then incorrectly re-mangled by the pipeline's number pattern.
+        """
+        if val:
+            # True case: not(not X) where X is truthy (a non-zero number)
+            # This double negation always evaluates to true for truthy values
+            # Alternative: simple comparison like (50 > 20)
+            strategy = random.choice(['double_not', 'comparison'])
+            if strategy == 'double_not':
+                # Use a raw integer; it will be mangled by the pipeline later
+                num = random.randint(1, 999)
+                return "not(not {})".format(num)
+            else:
+                # Comparison that always evaluates to true
+                a = random.randint(50, 500)
+                b = random.randint(1, 49)
+                return "({} > {})".format(a, b)
+        else:
+            # False case: not(X) where X is truthy
+            # Single negation of a truthy value always evaluates to false
+            # Use a raw integer; it will be mangled by the pipeline later
+            num = random.randint(1, 999)
+            return "not({})".format(num)
+
+    def _mangle_booleans(self, lua_code):
+        """
+        MoonVeil Logic Gate Booleans - Code Processing:
+        Finds all 'true' and 'false' literals in the code and replaces them
+        with logic gate expressions that evaluate to the same boolean value.
+        
+        Uses word boundary matching to avoid replacing partial words like 'istrue' or 'falsehood'.
+        Also avoids replacing booleans inside strings by using a tokenizer approach.
+        """
+        tokens = self._tokenize(lua_code)
+        transformed_tokens = []
+        
+        for kind, val in tokens:
+            # Only transform IDENT tokens that are exactly 'true' or 'false'
+            # This avoids touching strings, comments, or partial matches
+            if kind == 'IDENT' and val == 'true':
+                # Replace 'true' with a logic gate expression
+                mangled = self._mangle_boolean(True)
+                # Wrap in parens for safety in complex expressions
+                transformed_tokens.append(('OP', '('))
+                # Re-tokenize the mangled expression and add it
+                mangled_tokens = self._tokenize(mangled)
+                transformed_tokens.extend(mangled_tokens)
+                transformed_tokens.append(('OP', ')'))
+            elif kind == 'IDENT' and val == 'false':
+                # Replace 'false' with a logic gate expression
+                mangled = self._mangle_boolean(False)
+                # Wrap in parens for safety in complex expressions
+                transformed_tokens.append(('OP', '('))
+                mangled_tokens = self._tokenize(mangled)
+                transformed_tokens.extend(mangled_tokens)
+                transformed_tokens.append(('OP', ')'))
+            else:
+                transformed_tokens.append((kind, val))
+        
+        return self._reconstruct(transformed_tokens)
+
     def _mangle_string(self, text):
         """Wraps string in Ea('encrypted', 'key')"""
         key = self._generate_random_string(random.randint(4, 8))
@@ -459,10 +533,11 @@ end
         1. Clean (Remove Comments)
         2. AST Logic Inversion (Strategy A)
         3. Contextual Predicates (Strategy B)
-        4. Control Flow Flattening (The Maze) - NEW
-        5. Mangle Numbers (including those generated in 2/3/4)
-        6. Mangle Strings
-        7. Virtualize Globals
+        4. Control Flow Flattening (The Maze)
+        5. Logic Gate Booleans (MoonVeil) - Replaces true/false with logic expressions
+        6. Mangle Numbers (including those generated in 2/3/4/5)
+        7. Mangle Strings
+        8. Virtualize Globals
         """
         
         # 1. Clean
@@ -478,7 +553,12 @@ end
         # We wrap the processed code in the maze structure.
         lua_source = self._apply_control_flow_flattening(lua_source)
 
-        # 5. Mangle Numbers
+        # 5. Logic Gate Booleans (MoonVeil)
+        # Replaces 'true' and 'false' literals with logic gate expressions
+        # Must be done BEFORE number mangling so the numbers inside get obfuscated too
+        lua_source = self._mangle_booleans(lua_source)
+
+        # 6. Mangle Numbers
         # This will now also mangle the constants inside our Opaque Predicates and State Transitions
         # e.g., state = state + (-84379) -> state = state + ((10-94883) + ...)
         number_pattern = r'\b\d+(?:\.\d+)?\b'
@@ -487,7 +567,7 @@ end
         
         protected_code = re.sub(number_pattern, replace_number, lua_source)
         
-        # 6. Mangle Strings
+        # 7. Mangle Strings
         string_pattern = r'("([^"]*)"|\'([^\']*)\')'
         def replace_string(match):
             if match.group(2) is not None:
@@ -498,10 +578,10 @@ end
 
         protected_code = re.sub(string_pattern, replace_string, protected_code)
 
-        # 7. Mangle Globals
+        # 8. Mangle Globals
         protected_code = self._mangle_globals(protected_code)
 
-        # 8. Header
+        # 9. Header
         final_code = self._generate_header() + "\n" + protected_code
         
         return final_code
