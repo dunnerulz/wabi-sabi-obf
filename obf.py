@@ -3,7 +3,7 @@ import random
 import string
 import math
 
-class MoonveilObfuscator:
+class WabiSabiObfuscator:
     def __init__(self):
         self.var_Ma = "Ma"  # The global environment proxy
         self.var_Ea = "Ea"  # The string decryptor
@@ -16,162 +16,150 @@ class MoonveilObfuscator:
         return ''.join(random.choices(string.ascii_letters, k=length))
 
     def _xor_encrypt(self, text, key):
-        """Encrypts a string for the Ea() function"""
+        """
+        Encrypts a string for the Ea() function.
+        Matches the logic: 
+        byte(char) XOR byte(key[(i + math_offset) % len(key)])
+        The math offset in Lua is (kd-2053812/22084)%#da
+        2053812 / 22084 approx 93. So (kd - 93) % key_len.
+        To keep Python sync simple, we will simulate the result the Lua code expects.
+        """
         encrypted_chars = []
+        key_len = len(key)
+        
+        # The Lua math noise: (kd-2053812/22084)%#da
+        # We can just pick a static integer for the Python side that represents the result of that division
+        # 2053812 / 22084 = 93.0
+        OFFSET_VAL = 93 
+        
         for i, char in enumerate(text):
+            kd = i + 1 # Lua uses 1-based indexing for the loop
+            
+            # Calculate the index of the key character used in Lua
+            # Lua: (kd - 93) % #da + 1  (because lua arrays are 1-based)
+            # We map this to 0-based index for Python string access:
+            # key_index = ((kd - 93) % key_len) 
+            # Note: Python % handles negative numbers differently than Lua for some cases, 
+            # but for simple encryption rotation it's fine if we are consistent.
+            # To be safe and match Lua's behavior exactly:
+            lua_mod_index = (kd - OFFSET_VAL) % key_len
+            
+            # Since Lua 1-based index `+1` is usually done after mod, the char at `lua_mod_index` 
+            # in Python (0-based) corresponds to the key char used.
+            key_char_code = ord(key[int(lua_mod_index)])
+            
             char_code = ord(char)
-            # Simple shifting logic to match the Lua decryptor
-            # (In a full version, this would be a complex bitwise op)
-            enc_code = char_code ^ (ord(key[i % len(key)]) % 255)
+            enc_code = char_code ^ key_char_code
             encrypted_chars.append(f"\\{enc_code}")
+            
         return "".join(encrypted_chars)
 
     def _mangle_number(self, num_str):
         """
         Constant Folding / Number Mangling
-        Turns '5' into '10452-10447'
-        Turns '0.5' into '39600/79200'
         """
         try:
             val = float(num_str)
-            
-            # Preserve 0 and 1 slightly more cleanly to avoid heavy nesting on trivial checks
             if val == 0: return "(0)"
             if val == 1: return "(1)"
             
-            # Determine if we should use integer math or float math
             is_integer = val.is_integer()
+            op_type = random.choice([0, 1, 3]) 
             
-            # Strategy: Pick a random operation type
-            # 0: Addition (target = part_a + part_b) -> target = part_a + (target - part_a)
-            # 1: Subtraction (target = part_a - part_b) -> target = (target + part_b) - part_b
-            # 2: Multiplication (target = part_a * part_b) -> only if factors found (harder for arbitrary floats)
-            # 3: Division (target = part_a / part_b) -> target = (target * factor) / factor
-            
-            op_type = random.choice([0, 1, 3]) # Skip mult for now as it requires factoring
-            
-            if op_type == 0: # Addition: val = a + b
+            if op_type == 0: # Addition
                 part_a = random.randint(1000, 100000)
                 part_b = val - part_a
-                # Result: (part_a + part_b)
                 return f"({part_a}+{part_b})"
                 
-            elif op_type == 1: # Subtraction: val = a - b
+            elif op_type == 1: # Subtraction
                 part_b = random.randint(1000, 100000)
                 part_a = val + part_b
-                # Result: (part_a - part_b)
                 return f"({part_a}-{part_b})"
                 
-            elif op_type == 3: # Division: val = a / b
+            elif op_type == 3: # Division
                 if is_integer:
-                    # For integers, pick a random divisor (factor)
                     factor = random.randint(2, 50)
                     numerator = int(val * factor)
-                    # Result: (numerator / factor)
                     return f"({numerator}/{factor})"
                 else:
-                    # For floats (e.g., 0.5), pick a large factor to make it look like a fraction
-                    # 0.5 -> 500 / 1000
                     factor = random.randint(100, 100000)
                     numerator = val * factor
-                    # Result: (numerator / factor)
                     return f"({numerator}/{factor})"
             
             return num_str
-            
         except:
             return num_str
 
     def _mangle_string(self, text):
         """Wraps string in Ea('encrypted', 'key')"""
-        key = self._generate_random_string(4)
+        # Generate random key
+        key = self._generate_random_string(random.randint(4, 8))
         encrypted = self._xor_encrypt(text, key)
-        # Using the Moonveil signature call: Ea('enc', 'key')
+        
+        # Mangle the key string itself so it's not plain text in the source?
+        # For now, we leave the key as a plain string literal to avoid infinite recursion
+        # but in a real Wabi Sabi environment, the key itself might be obfuscated further or generated.
+        # We will just return the Ea call.
+        
         return f"{self.var_Ea}('{encrypted}','{key}')"
 
-    def _mangle_globals(self, lua_code):
-        """
-        Replaces global function calls with Ma[Ea('print')]...
-        Now includes a check to avoid mangling 'local game =' declarations.
-        """
-        # List of common globals to mangle
-        targets = ["print", "warn", "game", "workspace", "math", "table", "string", "task", "wait", "spawn"]
-        
-        # Replace 'game' with Ma[Ea('game', key)]
-        for target in targets:
-            # Pattern captures optional 'local ' prefix
-            # Group 1: 'local ' (or None)
-            # Group 2: The target word
-            pattern = r'(\blocal\s+)?\b(' + re.escape(target) + r')\b'
-            
-            def replace_match(match):
-                prefix = match.group(1)
-                word = match.group(2)
-                
-                # If preceded by 'local ', do NOT mangle the name (e.g., 'local game')
-                if prefix:
-                    return f"{prefix}{word}"
-                
-                # Otherwise, mangle it (e.g., '= game')
-                return f"{self.var_Ma}[{self._mangle_string(word)}]"
-            
-            lua_code = re.sub(pattern, replace_match, lua_code)
-            
-        return lua_code
-
     def _generate_header(self):
-        """Generates the Moonveil boilerplate (Ma, Ea, Ta)"""
-        # Fixed the #{self.var_string_byte}(da) bug to #da
-        return f"""-- Generated by Moonveil Base Implementation
+        """Generates the Wabi Sabi boilerplate (Ma, Ea, Ta)"""
+        # Defines the Ea function with the specific math noise mentioned in prompt:
+        # (kd-2053812/22084)%#da
+        # 2053812/22084 evaluates to ~93.
+        
+        return f"""-- Generated by Wabi Sabi Obfuscator
 local {self.var_Ma}=(getfenv())
 local {self.var_string_char},{self.var_string_byte},{self.var_bit_xor}=(string.char),(string.byte),(bit32 and bit32.bxor or function(a,b) local p,c=1,0 while a>0 and b>0 do local ra,rb=a%2,b%2 if ra~=rb then c=c+p end a,b,p=(a-ra)/2,(b-rb)/2,p*2 end if a<b then a=b end while a>0 do local ra=a%2 if ra>0 then c=c+p end a,p=(a-ra)/2,p*2 end return c end)
 local {self.var_Ea}=function(ib,da)
     local Vb=''
     for kd=1,#ib do
-        local key_char = {self.var_string_byte}(da, (kd-1)%#da + 1)
+        local key_char = {self.var_string_byte}(da, (kd-2053812/22084)%#da + 1)
         local str_char = {self.var_string_byte}(ib, kd)
         Vb=Vb..{self.var_string_char}({self.var_bit_xor}(str_char, key_char))
     end
     return Vb
 end
-local {self.var_Ta}={{}}
 """
 
     def obfuscate(self, lua_source):
         """
-        New simplified obfuscation logic:
-        1. No CFF (Control Flow Flattening)
-        2. No Global Mangling
-        3. No String Mangling
-        4. ONLY Number Mangling (with float support)
+        Logic:
+        1. Mangle Numbers (Constant Folding)
+        2. Mangle Strings (Polyadic XOR)
         """
         
-        # We process the whole source string directly to avoid breaking multiline structures by line-splitting
-        
-        # Regex to match numbers, including floats (e.g., 100, 3.14, 0.5)
-        # Explaining the pattern:
-        # \b       : Word boundary (start of number)
-        # \d+      : One or more digits
-        # (?:      : Non-capturing group for decimals
-        #   \.     : Literal dot
-        #   \d+    : One or more digits
-        # )?       : Optional decimal part
-        # \b       : Word boundary (end of number)
-        # Note: This might miss .5 starting with dot, but is safer for now.
+        # 1. Mangle Numbers
+        # We use the regex from previous step
         number_pattern = r'\b\d+(?:\.\d+)?\b'
-        
         def replace_number(match):
-            original = match.group(0)
-            return self._mangle_number(original)
-            
-        # Apply number mangling
+            return self._mangle_number(match.group(0))
+        
+        # We perform number mangling FIRST.
+        # If we did strings first, the number mangler might try to mangle numbers inside the encrypted string bytes (e.g., \100)
         protected_code = re.sub(number_pattern, replace_number, lua_source)
         
-        # For this specific "Number Mangler Only" request, we don't need the Moonveil header 
-        # (Ma, Ea) because we aren't using them in the code body.
-        # Just return the code with mangled numbers.
+        # 2. Mangle Strings
+        # Use a combined regex to avoid double-obfuscation (replacing output of previous replacements)
+        # Matches either "..." or '...'
+        string_pattern = r'("([^"]*)"|\'([^\']*)\')'
         
-        return "-- Moonveil: Number Mangler Mode\n" + protected_code
+        def replace_string(match):
+            # Group 2 is content of double quotes "..."
+            # Group 3 is content of single quotes '...'
+            if match.group(2) is not None:
+                content = match.group(2)
+            else:
+                content = match.group(3)
+            return self._mangle_string(content)
+
+        protected_code = re.sub(string_pattern, replace_string, protected_code)
+
+        # 3. Prepend Header
+        final_code = self._generate_header() + "\n" + protected_code
+        
+        return final_code
 
 # --- Usage ---
 if __name__ == "__main__":
@@ -198,7 +186,7 @@ if __name__ == "__main__":
     except:
         pass
 
-    obfuscator = MoonveilObfuscator()
+    obfuscator = WabiSabiObfuscator()
     protected = obfuscator.obfuscate(input_code)
     
     with open("output.lua", "w") as f:
