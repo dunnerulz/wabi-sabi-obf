@@ -103,6 +103,51 @@ class WabiSabiObfuscator:
         
         return f"{self.var_Ea}('{encrypted}','{key}')"
 
+    def _mangle_globals(self, lua_code):
+        """
+        Replaces global function calls with Ma[Ea('print')]...
+        Includes a check to avoid mangling 'local game =' declarations or table properties.
+        """
+        # List of common globals to mangle (Standard Lua + Roblox/Matcha Specifics)
+        targets = [
+            "print", "warn", "error", "game", "workspace", "math", "table", "string", 
+            "task", "wait", "spawn", "getfenv", "setfenv", "pcall", "xpcall", 
+            "pairs", "ipairs", "next", "type", "tostring", "tonumber", "select", 
+            "unpack", "require", "Drawing", "Vector2", "Vector3", "CFrame", 
+            "Color3", "UDim2", "Instance", "Enum", "RaycastParams", "Random", 
+            "utf8", "os", "coroutine", "debug", "tick", "time", "delay", "defer",
+            "getgenv", "getrenv", "identifyexecutor", "setclipboard", "readfile", 
+            "writefile", "isfile", "delfile", "listfiles", "makefolder", "delfolder",
+            "iskeypressed", "mouse1click", "ismouse1pressed", "mouse2click", "ismouse2pressed"
+        ]
+        
+        # Sort targets by length descending to prevent substring issues (e.g. replacing 'os' inside 'position')
+        targets.sort(key=len, reverse=True)
+
+        for target in targets:
+            # Regex Explanation:
+            # (?<!\.)       : Negative lookbehind. Ensures the target is NOT preceded by a dot (e.g. avoid mangling myTable.print)
+            # (\blocal\s+)? : Optional Group 1. Matches 'local ' followed by whitespace. 
+            #                 Used to detect variable declarations.
+            # \bTARGET\b    : Matches the target word with word boundaries (e.g. matches 'game' but not 'gameplay')
+            
+            pattern = r'(?<!\.)(\blocal\s+)?\b(' + re.escape(target) + r')\b'
+            
+            def replace_match(match):
+                prefix = match.group(1) # 'local ' or None
+                word = match.group(2)   # The target global name
+                
+                # If preceded by 'local ', do NOT mangle the name (e.g., 'local game')
+                if prefix:
+                    return f"{prefix}{word}"
+                
+                # Otherwise, mangle it (e.g., '= game' becomes '= Ma[Ea("game", key)]')
+                return f"{self.var_Ma}[{self._mangle_string(word)}]"
+            
+            lua_code = re.sub(pattern, replace_match, lua_code)
+            
+        return lua_code
+
     def _generate_header(self):
         """Generates the Wabi Sabi boilerplate (Ma, Ea, Ta)"""
         # Defines the Ea function with the specific math noise mentioned in prompt:
@@ -128,26 +173,21 @@ end
         Logic:
         1. Mangle Numbers (Constant Folding)
         2. Mangle Strings (Polyadic XOR)
+        3. Environment Virtualization (Globals -> Ma[Ea])
         """
         
         # 1. Mangle Numbers
-        # We use the regex from previous step
         number_pattern = r'\b\d+(?:\.\d+)?\b'
         def replace_number(match):
             return self._mangle_number(match.group(0))
         
-        # We perform number mangling FIRST.
-        # If we did strings first, the number mangler might try to mangle numbers inside the encrypted string bytes (e.g., \100)
         protected_code = re.sub(number_pattern, replace_number, lua_source)
         
         # 2. Mangle Strings
-        # Use a combined regex to avoid double-obfuscation (replacing output of previous replacements)
         # Matches either "..." or '...'
         string_pattern = r'("([^"]*)"|\'([^\']*)\')'
         
         def replace_string(match):
-            # Group 2 is content of double quotes "..."
-            # Group 3 is content of single quotes '...'
             if match.group(2) is not None:
                 content = match.group(2)
             else:
@@ -156,7 +196,11 @@ end
 
         protected_code = re.sub(string_pattern, replace_string, protected_code)
 
-        # 3. Prepend Header
+        # 3. Mangle Globals (Environment Virtualization)
+        # We do this LAST so that the strings generated here (keys for Ea) don't get re-mangled.
+        protected_code = self._mangle_globals(protected_code)
+
+        # 4. Prepend Header
         final_code = self._generate_header() + "\n" + protected_code
         
         return final_code
