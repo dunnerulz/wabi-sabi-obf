@@ -41,13 +41,20 @@ class WabiSabiObfuscator:
             val = float(num_str)
             if val == 0: return "((10-10)*5)"
             
-            # MoonVeil Strategy: Float Multiplication
-            # Target: 100
-            # Gen: 0.05 * 2000
-            factor = random.randint(1000, 50000)
-            multiplier = val / factor
-            # Lua format needs high precision
-            return f"({multiplier} * {factor})"
+            # Revised Strategy: Additive Splitting for Precision
+            # Previous Multiplicative strategy (val / factor * factor) caused float precision errors
+            # (e.g. 9.999999 instead of 10) which broke table indices and equality checks.
+            # Additive (val - offset + offset) is safe for integers up to 2^53.
+            
+            offset = random.randint(100, 10000)
+            
+            # If it looks like an integer, keep it cleaner to avoid float casting in Lua
+            if val.is_integer():
+                remainder = int(val) - offset
+                return f"({remainder} + {offset})"
+            else:
+                remainder = val - offset
+                return f"({remainder} + {offset})"
         except:
             return num_str
 
@@ -127,9 +134,22 @@ class WabiSabiObfuscator:
 
     def _mangle_string(self, text):
         """Wraps string in Ea('encrypted', 'key')"""
+        
+        # FIX: Interpret escape sequences like \n, \t into actual characters
+        # before encryption. `re` gives us raw strings like "Line1\\nLine2".
+        # We need "Line1\nLine2" for the XOR loop to encrypt the newline byte (10)
+        # instead of encrypting backslash (92) and n (110).
+        try:
+            # bytes(text, "utf-8").decode("unicode_escape") handles standard escapes
+            decoded_text = bytes(text, "utf-8").decode("unicode_escape")
+        except:
+            # Fallback if decoding fails (e.g. complex unicode), use original
+            decoded_text = text
+            
         key = self._generate_random_string(random.randint(4, 8))
-        encrypted = self._xor_encrypt(text, key)
-        return f"{self.var_Ea}('{encrypted}','{key}')"
+        encrypted = self._xor_encrypt(decoded_text, key)
+        # Added spaces around the function call to prevent token merging
+        return f" {self.var_Ea}('{encrypted}','{key}') "
 
     def _mangle_globals(self, lua_code):
         """
@@ -161,6 +181,7 @@ class WabiSabiObfuscator:
                 word = match.group(2)   # The target global name
                 if prefix:
                     return f"{prefix}{word}"
+                # Added spaces here as well for safety, though \b usually protects globals.
                 return f"{self.var_Ma}[{self._mangle_string(word)}]"
             
             lua_code = re.sub(pattern, replace_match, lua_code)
@@ -174,14 +195,14 @@ class WabiSabiObfuscator:
     def _generate_junk_code(self):
         """
         Generates garbage Lua code that is syntactically valid but does nothing useful.
-        Adheres to 'Lua vm fps... prefer wait(.001)' for loops.
+        REMOVED wait() to prevent UI throttling.
         """
         var_name = self._generate_random_string(4)
         var_name_2 = self._generate_random_string(4)
         
         junk_types = [
-            # Type 1: Useless Math Loop
-            f"local {var_name} = 0; for i=1, {random.randint(2, 5)} do {var_name}={var_name}+1; wait(0.001); end",
+            # Type 1: Useless Math Loop (NO WAIT)
+            f"local {var_name} = 0; for i=1, {random.randint(2, 5)} do {var_name}={var_name}+1; end",
             # Type 2: Table Junk
             f"local {var_name} = {{}}; {var_name}[1] = {random.randint(1,99)};",
             # Type 3: Simple math
@@ -208,11 +229,13 @@ class WabiSabiObfuscator:
             # Square is always >= 0
             (f"( ({val_a} * {val_a}) >= 0 )", True),
             # Absolute value check
-            (f"( math.abs({-val_a}) == {val_a} )", True),
+            # REMOVED: Strict equality check (==) which is dangerous with floats
+            # REPLACED WITH: Inequality check which is safer
+            (f"( math.abs({-val_a}) >= 0 )", True),
             # Impossible check
             (f"( {val_a} < {-val_a} )", False),
-            # Simple inequality
-            (f"( {val_a} + {val_b} == {val_a + val_b} )", True)
+            # Simple inequality - Changed from strict equality
+            (f"( {val_a} + {val_b} >= {val_a} )", True)
         ]
         
         return random.choice(predicates)
@@ -228,7 +251,9 @@ class WabiSabiObfuscator:
             ('KEYWORD', r'\b(if|then|else|elseif|end|do|function|repeat|until|while|for|local)\b'), # Keywords for blocking
             ('IDENT',   r'[A-Za-z_][A-Za-z0-9_]*'),    # Identifiers
             ('OP',      r'[+\-*/%^#=~<>()\[\]{},;.]'), # Operators
-            ('NUMBER',  r'0[xX][0-9a-fA-F]+|\d+(\.\d*)?'), # Numbers (Updated to include Hex)
+            # UPDATED: Matches Hex (0x...), Scientific (1e10), and Standard Numbers.
+            # Prevents splitting "1e10" into "1", "e", "10" which causes syntax errors in reconstruction.
+            ('NUMBER',  r'0[xX][0-9a-fA-F]+(?:(?:\.[0-9a-fA-F]*)?(?:[pP][+-]?\d+)?)?|\b\d+(?:\.\d*)?(?:[eE][+-]?\d+)?\b'), 
             ('WS',      r'\s+'),                       # Whitespace
             ('MISC',    r'.'),                         # Any other char
         ]
@@ -561,7 +586,8 @@ end
         # 6. Mangle Numbers
         # This will now also mangle the constants inside our Opaque Predicates and State Transitions
         # e.g., state = state + (-84379) -> state = state + ((10-94883) + ...)
-        number_pattern = r'\b\d+(?:\.\d+)?\b'
+        # UPDATED: Regex to support hex/scientific numbers so they aren't split by mangle_number
+        number_pattern = r'0[xX][0-9a-fA-F]+(?:(?:\.[0-9a-fA-F]*)?(?:[pP][+-]?\d+)?)?|\b\d+(?:\.\d*)?(?:[eE][+-]?\d+)?\b'
         def replace_number(match):
             return self._mangle_number(match.group(0))
         
@@ -603,7 +629,7 @@ if __name__ == "__main__":
     while true do
         print("Looping...")
         check_enemy(LocalPlayer)
-        task.wait(1)
+        wait(1)
     end
     """
     
